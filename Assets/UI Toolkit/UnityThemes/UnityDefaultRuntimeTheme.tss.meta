@@ -1,0 +1,11 @@
+fileFormatVersion: 2
+guid: 4deb24b6a50395641b7616254b1bcd1b
+ScriptedImporter:
+  internalIDToNameTable: []
+  externalObjects: {}
+  serializedVersion: 2
+  userData: 
+  assetBundleName: loxvmod
+  assetBundleVariant: assets
+  script: {fileID: 12388, guid: 0000000000000000e000000000000000, type: 0}
+  disableValidation: 0

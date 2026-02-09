@@ -1,0 +1,31 @@
+%YAML 1.1
+%TAG !u! tag:unity3d.com,2011:
+--- !u!114 &11400000
+MonoBehaviour:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  m_GameObject: {fileID: 0}
+  m_Enabled: 1
+  m_EditorHideFlags: 0
+  m_Script: {fileID: 1200417347, guid: bf4f8e9d381df7748a18799ffddf5ad5, type: 3}
+  m_Name: ExportSettings
+  m_EditorClassIdentifier: 
+  _author: SRA
+  _description: Initial
+  _name: LoxVMod
+  _outputDirectory: C:/Users/steph/Documents/My Games/Stationeers/mods
+  _stationeersDirectory: C:/Program Files (x86)/Steam/steamapps/common/Stationeers
+  _stationeersArguments: 
+  _version: 0.6.xx
+  _assemblies:
+  - Assets/Scripts/LoxVM/LoxVMod.asmdef
+  _artifacts: []
+  _contentTypes: -1
+  _includePdbs: 0
+  _waitForDebugger: 0
+  _bootType: 0
+  _startupPrefab: {fileID: 0}
+  _startupClass: LoxVMod
+  _startupScene: 

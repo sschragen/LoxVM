@@ -1,0 +1,1555 @@
+﻿using Cysharp.Threading.Tasks;
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Runtime.CompilerServices;
+using UnityEngine;
+
+namespace ULox
+{
+    //this could maybe move as nested inside vm
+    public enum InterpreterResult
+    {
+        OK,
+        YIELD,
+        ERROR,
+    }
+
+    public enum InterpreterState
+    {
+        STOPPED, 
+        YIELDED,
+        RUNNING,
+        SLEEPING,
+        PAUSED,
+        ERROR
+    }
+
+    public sealed class Vm
+    {
+        private readonly ClosureInternal NativeCallClosure;
+
+        private readonly FastStack<Value> _valueStack = new();
+        internal FastStack<Value> ValueStack => _valueStack;
+        private readonly FastStack<CallFrame> _callFrames = new();
+        internal FastStack<CallFrame> CallFrames => _callFrames;
+        private CallFrame _currentCallFrame;
+        private Chunk _currentChunk;
+        public Engine Engine { get; internal set; }
+        private readonly LinkedList<Value> openUpvalues = new();
+        public Table Globals { get; private set; } = new Table();
+        //public TestRunner TestRunner { get; private set; } = new TestRunner(() => new Vm());
+        public VmTracingReporter Tracing { get; set; }
+
+        public InterpreterState interpreterState = InterpreterState.STOPPED;
+        public double interpreterSleepTime = 2;
+
+        /// todo: 
+        /// this should move to platform
+        //public float runtimeLimit = 0.01f; 
+        public IPlatform platform;
+
+        
+
+        public Vm()
+        {
+            var nativeChunk = new Chunk("NativeCallChunkWrapper", "Native", "");
+            nativeChunk.WritePacket(new ByteCodePacket(OpCode.NATIVE_CALL), 0);
+            NativeCallClosure = new ClosureInternal() { chunk = nativeChunk };
+            
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public void Push(Value val) => _valueStack.Push(val);
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public Value Pop() => _valueStack.Pop();
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public (Value, Value) Pop2()
+        {
+#if !FASTSTACK_FORCE_CLEAR
+            _valueStack.DiscardPop(2);
+            return (_valueStack.Peek(-2), _valueStack.Peek(-1));
+#else
+            return (_valueStack.Pop(), _valueStack.Pop());
+#endif
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public Value Peek(int ind = 0) => _valueStack.Peek(ind);
+
+        public Value GetArg(int index)
+            => _valueStack[_currentCallFrame.StackStart + index];
+
+        public async UniTask<InterpreterResult> PushCallFrameAndRun(Value func, byte args)
+        {
+            try
+            {
+                PushCallFrameFromValue(func, args);
+                return await Run();
+                //return InterpreterResult.OK;
+            }
+            catch(UloxException uloxEx)
+            {
+                throw uloxEx;
+            }
+            catch (System.Exception e)
+            {
+                throw new UloxException($"Unhandled exception '{e}'");
+                
+            }
+            
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public void SetNativeReturn(byte returnIndex, Value val)
+        {
+            _valueStack[_currentCallFrame.StackStart + _currentCallFrame.ArgCount + returnIndex + 1] = val;
+        }
+
+        public void CopyFrom(Vm otherVM)
+        {
+            Engine = otherVM.Engine;
+
+            Globals.CopyFrom(otherVM.Globals);
+
+            foreach (var val in otherVM._valueStack)
+            {
+                Push(val);
+            }
+
+            //TestRunner = otherVM.TestRunner;
+        }
+
+        public void CopyStackFrom(Vm vm)
+        {
+            _valueStack.Reset();
+
+            for (int i = 0; i < vm._valueStack.Count; i++)
+            {
+                _valueStack.Push(vm._valueStack[i]);
+            }
+
+            for (int i = 0; i < vm._callFrames.Count; i++)
+            {
+                _callFrames.Push(vm._callFrames[i]);
+            }
+
+            _currentCallFrame = vm._currentCallFrame;
+            _currentChunk = vm._currentChunk;
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private ByteCodePacket ReadPacket(Chunk chunk)
+            => chunk.Instructions[_currentCallFrame.InstructionPointer++];
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private void PushNewCallFrame(CallFrame callFrame)
+        {
+            if (_callFrames.Count > 0)
+            {
+                //save current state
+                _callFrames.SetAt(_callFrames.Count - 1, _currentCallFrame);
+            }
+
+            _currentCallFrame = callFrame;
+            _currentChunk = _currentCallFrame.Closure.chunk;
+
+            Tracing?.ProcessPushCallFrame(callFrame);
+
+            _callFrames.Push(callFrame);
+            for (int i = 0; i < callFrame.ReturnCount; i++)
+            {
+                ValueStack.Push(Value.Null());
+            }
+        }
+
+        public async UniTask<InterpreterResult> Interpret(Chunk chunk)
+        {
+            //push this empty string to match the expectation of the function compiler
+            Push(Value.New(new ClosureInternal() { chunk = chunk }));
+            PushCallFrameFromValue(Peek(), 0);
+            await Run();
+            //interpreterState= InterpreterState.STOPPED;
+            return InterpreterResult.OK;
+        } 
+
+        public async UniTask<InterpreterResult> Run()
+        {
+            
+            interpreterState = InterpreterState.RUNNING;
+            float now = Time.time;
+            float nextYield = now + platform.TimeSlice();// runtimeLimit;
+            //platform.Warn($"Time.Now : {now} Next Yield {nextYield}");
+            while (interpreterState != InterpreterState.STOPPED)
+            {
+                var chunk = _currentChunk;
+
+                var packet = ReadPacket(chunk);
+                var opCode = packet.OpCode;
+
+                //Tracing?.ProcessingOpCode(chunk, opCode);
+
+                if (Time.time > nextYield) interpreterState= InterpreterState.YIELDED;
+                //UnityEngine.Debug.Log("");
+                //UnityEngine.Debug.Log($" > IP : {_currentCallFrame.InstructionPointer-1} OpCode : {opCode} ");
+                switch (interpreterState)
+                {
+                    case InterpreterState.YIELDED:
+                        await UniTask.DelayFrame(1);
+
+                        if (interpreterState == InterpreterState.YIELDED)
+                            interpreterState = InterpreterState.RUNNING;
+
+                        nextYield = Time.time + platform.TimeSlice();// runtimeLimit;
+                        break;
+                    case InterpreterState.SLEEPING:
+                        await UniTask.WaitForSeconds((float)interpreterSleepTime);
+                        
+                        if (interpreterState==InterpreterState.SLEEPING)
+                            interpreterState = InterpreterState.RUNNING;
+
+                        nextYield = Time.time + platform.TimeSlice();// runtimeLimit;
+                        break;
+                    case InterpreterState.STOPPED:
+                        return InterpreterResult.OK;
+                    case InterpreterState.PAUSED:
+                        do
+                        {
+                            await UniTask.DelayFrame(20);
+                        }while (interpreterState==InterpreterState.PAUSED);
+                        nextYield = Time.time + platform.TimeSlice();// runtimeLimit;
+                        break;
+                }
+                switch (opCode)
+                {
+                    case OpCode.PUSH_CONSTANT:
+                        Push(chunk.ReadConstant(packet.b1)); //could be anything
+                        break;
+
+                    case OpCode.RETURN:
+                        if (DoReturnOp())
+                        {
+                            interpreterState = InterpreterState.STOPPED;
+                            //return InterpreterResult.OK;
+                        }
+                        break;
+                    case OpCode.MULTI_VAR:
+                        DoMultiVarOp(packet.b1, packet.b2);
+                        break;
+                    case OpCode.YIELD:
+                        //UnityEngine.Debug.Log("OpCode.YIELD");
+                        interpreterState = InterpreterState.YIELDED;
+                        break;
+                    case OpCode.SLEEP:
+                        //Debug.Log(VmUtil.GenerateValueStackDump(this));
+                        //var (rhss, lhss) = Pop2OrLocals(, packet.b2);
+                        interpreterSleepTime = PopOrLocal(packet.b1).val.asDouble;
+                        //UnityEngine.Debug.Log($" # OpCode.SLEEP : {interpreterSleepTime}");
+                        //Debug.Log(VmUtil.GenerateValueStackDump(this));
+                        interpreterState = InterpreterState.SLEEPING;
+                        break;
+
+                    case OpCode.NEGATE:
+                        Push(Value.New(-PopOrLocal(packet.b1).val.asDouble));
+                        break;
+
+                    case OpCode.ADD:
+                        {
+                            var (rhs, lhs) = Pop2OrLocals(packet.b1, packet.b2);
+                            var res = Value.Null();
+
+                            if (lhs.type == ValueType.Double
+                                && rhs.type == ValueType.Double)
+                            {
+                                res = Value.New(lhs.val.asDouble + rhs.val.asDouble);
+                            }
+                            else if (lhs.type == ValueType.String
+                                    || rhs.type == ValueType.String)
+                            {
+                                res = Value.New(lhs.ToString() + rhs.ToString());
+                            }
+                            else
+                            {
+                                ThrowRuntimeException($"Cannot perform op across types '{lhs.type}' and '{rhs.type}'");
+                            }
+
+                            SetLocalRegisterFromValue(packet.b3, res);
+                            Push(res);
+                        }
+                        break;
+                    case OpCode.SUBTRACT:
+                        {
+                            var (rhs, lhs) = Pop2OrLocals(packet.b1, packet.b2);
+                            var res = Value.Null();
+
+                            if (lhs.type == ValueType.Double
+                                && rhs.type == ValueType.Double)
+                            {
+                                res = Value.New(lhs.val.asDouble - rhs.val.asDouble);
+                            }
+                            else
+                            {
+                                ThrowRuntimeException($"Cannot perform op across types '{lhs.type}' and '{rhs.type}'");
+                            }
+
+                            SetLocalRegisterFromValue(packet.b3, res);
+                            Push(res);
+                        }
+                        break;
+                    case OpCode.MULTIPLY:
+                        {
+                            var (rhs, lhs) = Pop2OrLocals(packet.b1, packet.b2);
+                            var res = Value.Null();
+
+                            if (lhs.type == ValueType.Double
+                                && rhs.type == ValueType.Double)
+                            {
+                                res = Value.New(lhs.val.asDouble * rhs.val.asDouble);
+                            }
+                            else
+                            {
+                                ThrowRuntimeException($"Cannot perform op across types '{lhs.type}' and '{rhs.type}'");
+                            }
+
+                            SetLocalRegisterFromValue(packet.b3, res);
+                            Push(res);
+                        }
+                        break;
+                    case OpCode.DIVIDE:
+                        {
+                            var (rhs, lhs) = Pop2OrLocals(packet.b1, packet.b2);
+                            var res = Value.Null();
+
+                            if (lhs.type == ValueType.Double
+                                && rhs.type == ValueType.Double)
+                            {
+                                res = Value.New(lhs.val.asDouble / rhs.val.asDouble);
+                            }
+                            else
+                            {
+                                ThrowRuntimeException($"Cannot perform op across types '{lhs.type}' and '{rhs.type}'");
+                            }
+
+                            SetLocalRegisterFromValue(packet.b3, res);
+                            Push(res);
+                        }
+                        break;
+                    case OpCode.MODULUS:
+                        {
+                            var (rhs, lhs) = Pop2OrLocals(packet.b1, packet.b2);
+                            var res = Value.Null();
+
+                            if (lhs.type == ValueType.Double
+                                && rhs.type == ValueType.Double)
+                            {
+                                var lhsd = lhs.val.asDouble;
+                                var rhsd = rhs.val.asDouble;
+                                res = Value.New(((lhsd % rhsd) + rhsd) % rhsd);
+                            }
+                            else
+                            {
+                                ThrowRuntimeException($"Cannot perform op across types '{lhs.type}' and '{rhs.type}'");
+                            }
+
+                            SetLocalRegisterFromValue(packet.b3, res);
+                            Push(res);
+                        }
+                        break;
+
+                    case OpCode.EQUAL:
+                        {
+                            var (rhs, lhs) = Pop2OrLocals(packet.b1, packet.b2);
+                            var res = Value.New(Value.Compare(ref lhs, ref rhs));
+                            SetLocalRegisterFromValue(packet.b3, res);
+                            Push(res);
+                        }
+                        break;
+
+                    case OpCode.LESS:
+                        {
+                            var (rhs, lhs) = Pop2OrLocals(packet.b1, packet.b2);
+                            var res = Value.Null();
+
+                            if (lhs.type != ValueType.Instance)
+                            {
+                                if (lhs.type != ValueType.Double || rhs.type != ValueType.Double)
+                                    ThrowRuntimeException($"Cannot perform op '{opCode}' compare on different types '{lhs.type}' and '{rhs.type}'");
+
+                                res = Value.New(lhs.val.asDouble < rhs.val.asDouble);
+                            }
+                            else
+                            {
+                                ThrowRuntimeException($"Cannot perform op '{opCode}' on user types '{lhs.val.asInstance.FromUserType}' and '{rhs}'");
+                            }
+
+                            SetLocalRegisterFromValue(packet.b3, res);
+                            Push(res);
+                        }
+                        break;
+                    case OpCode.GREATER:
+                        {
+                            var (rhs, lhs) = Pop2OrLocals(packet.b1, packet.b2);
+                            var res = Value.Null();
+
+                            if (lhs.type != ValueType.Instance)
+                            {
+                                if (lhs.type != ValueType.Double || rhs.type != ValueType.Double)
+                                    ThrowRuntimeException($"Cannot perform op '{opCode}' compare on different types '{lhs.type}' and '{rhs.type}'");
+
+                                res = Value.New(lhs.val.asDouble > rhs.val.asDouble);
+                            }
+                            else
+                            {
+                                ThrowRuntimeException($"Cannot perform op '{opCode}' on user types '{lhs.val.asInstance.FromUserType}' and '{rhs}'");
+                            }
+
+                            SetLocalRegisterFromValue(packet.b3, res);
+                            Push(res);
+                        }
+                        break;
+
+                    case OpCode.NOT:
+                        Push(Value.New(PopOrLocal(packet.b1).IsFalsey()));
+                        break;
+
+                    case OpCode.PUSH_VALUE:
+                        {
+                            var pushType = (PushValueOpType)packet.b1;
+                            switch (pushType)
+                            {
+                                case PushValueOpType.Null:
+                                    Push(Value.Null());
+                                    break;
+                                case PushValueOpType.Bool:
+                                    Push(Value.New(packet.b2 == 1));
+                                    break;
+                                case PushValueOpType.Short:
+                                    Push(Value.New(packet.ShortValue));
+                                    break;
+                                default:
+                                    break;
+                            }
+                        }
+                        break;
+                    case OpCode.PUSH_QUOTIENT:
+                        {
+                            var val = packet.quotientDetails.GetNumeratorShort() / (double)packet.quotientDetails.denom;
+                            Push(Value.New(val));
+                        }
+                        break;
+
+                    case OpCode.POP:
+                        _valueStack.DiscardPop(packet.b1);
+                        break;
+
+                    case OpCode.DUPLICATE:
+                        {
+                            var v = PopOrLocal(packet.b1);
+                            Push(v);
+                            Push(v);
+                        }
+                        break;
+
+                    case OpCode.GET_LOCAL:
+                        var b3 = packet.b3;
+                        var b2 = packet.b2;
+                        var b1 = packet.b1;
+                        _valueStack.Push(_valueStack[_currentCallFrame.StackStart + packet.b1]);
+                        if (b2 != Optimiser.NOT_LOCAL_BYTE)
+                            Push(_valueStack[_currentCallFrame.StackStart + b2]);
+                        if (b3 != Optimiser.NOT_LOCAL_BYTE)
+                            Push(_valueStack[_currentCallFrame.StackStart + b3]);
+                        break;
+
+                    case OpCode.SET_LOCAL:
+                        _valueStack[_currentCallFrame.StackStart + packet.b1] = _valueStack.Peek();
+                        break;
+
+                    case OpCode.GET_UPVALUE:
+                        {
+                            var upval = _currentCallFrame.Closure.upvalues[packet.b1].val.asUpvalue;
+                            if (!upval.isClosed)
+                                Push(_valueStack[upval.index]);
+                            else
+                                Push(upval.value);
+                        }
+                        break;
+
+                    case OpCode.SET_UPVALUE:
+                        {
+                            var upval = _currentCallFrame.Closure.upvalues[packet.b1].val.asUpvalue;
+                            if (!upval.isClosed)
+                                _valueStack[upval.index] = Peek();
+                            else
+                                upval.value = Peek();
+                        }
+                        break;
+
+                    case OpCode.DEFINE_GLOBAL:
+                        {
+                            var globalName = chunk.ReadConstant(packet.b1); //always string
+                            var popped = Pop();
+                            Globals.AddOrSet(globalName.val.asString, popped);
+                        }
+                        break;
+
+                    case OpCode.FETCH_GLOBAL:
+                        {
+                            //UnityEngine.Debug.Log($" > OpCode.FETCH_GLOBAL ");
+                            var globalName = chunk.ReadConstant(packet.b1); //always string
+                            //UnityEngine.Debug.Log($" > read globalName {globalName} ");
+                            var actualName = globalName.val.asString;
+                            //UnityEngine.Debug.Log($" >      actualName {actualName} ");
+                            if (Globals.Get(actualName, out var found))
+                            {
+                                //UnityEngine.Debug.Log($" > push found {found} ");
+                                Push(found);
+                            }
+                            else
+                                ThrowRuntimeException($"No global of name '{actualName}' could be found");
+                        }
+                        break;
+
+                    case OpCode.ASSIGN_GLOBAL:
+                        {
+                            var globalName = chunk.ReadConstant(packet.b1); //always string
+                            var actualName = globalName.val.asString;
+                            if (!Globals.Contains(actualName))
+                            {
+                                ThrowRuntimeException($"Global var of name '{actualName}' was not found");
+                            }
+                            Globals.Set(actualName, Peek());
+                        }
+                        break;
+                    case OpCode.CALL:
+                        {
+                            var argCount = packet.b1;
+                            PushCallFrameFromValue(Peek(argCount), argCount);
+                        }
+                        break;
+
+                    case OpCode.CLOSURE:
+                        DoClosureOp(chunk, packet.closureDetails);
+                        break;
+
+                    case OpCode.CLOSE_UPVALUE:
+                        CloseUpvalues(_valueStack.Count - 1);
+                        _valueStack.DiscardPop();
+                        break;
+
+                    case OpCode.PANIC:
+                        interpreterState = InterpreterState.STOPPED;
+                        ThrowRuntimeException(Pop().ToString());
+                        break;
+
+                    case OpCode.NATIVE_CALL:
+                        //await UniTask.SwitchToMainThread();
+                        DoNativeCall(opCode);
+                        //await UniTask.SwitchToThreadPool();
+                        break;
+
+                    case OpCode.VALIDATE:
+                        DoValidateOp(packet.ValidateOp);
+                        break;
+
+                    case OpCode.GET_PROPERTY:
+                        {
+                            var targetVal = PopOrLocal(packet.b3);
+                            DoGetPropertyOp(chunk, packet.b1, targetVal);
+                            var assignVal = packet.b2;
+                            if (assignVal != Optimiser.NOT_LOCAL_BYTE)
+                            {
+                                SetLocalRegisterFromValue(assignVal, Pop());
+                            }
+                        }
+                        break;
+
+                    case OpCode.SET_PROPERTY:
+                        {
+                            var (newVal, targetVal) = Pop2OrLocals(packet.b2, packet.b3);
+                            DoSetPropertyOp(chunk, packet.b1, targetVal, newVal);
+                        }
+                        break;
+
+                    case OpCode.INVOKE:
+                        DoInvokeOp(chunk, packet.b1, packet.b2);
+                        break;
+/*
+                    case OpCode.TEST:
+                        TestRunner.DoTestOpCode(this, chunk, packet.testOpDetails);
+                        break;
+*/
+                    case OpCode.NATIVE_TYPE:
+                        switch (packet.NativeType)
+                        {
+                            case NativeType.List:
+                                Push(NativeListClass.SharedNativeListClassValue);
+                                break;
+                            case NativeType.Dynamic:
+                                Push(DynamicClass.SharedDynamicClassValue);
+                                break;
+                            default:
+                                ThrowRuntimeException($"Unhanlded native type creation '{packet.NativeType}'");
+                                break;
+                        }
+
+                        PushCallFrameFromValue(Peek(0), 0);
+                        break;
+
+                    case OpCode.GET_INDEX:
+                        {
+                            var (indexOrName, targetValue) = Pop2OrLocals(packet.b1, packet.b2);
+                            var res = Value.Null();
+                            if (targetValue.type == ValueType.Instance)
+                            {
+                                if (targetValue.val.asInstance is INativeCollection nativeCol)
+                                {
+                                    res = nativeCol.Get(indexOrName);
+                                }
+                                else
+                                {
+                                    var instance = targetValue.val.asInstance;
+                                    if (!instance.Fields.Get(indexOrName.val.asString, out res))
+                                    {
+                                        ThrowRuntimeException($"No field of name '{indexOrName.val.asString}' could be found on instance '{instance}'");
+                                    }
+                                }
+                            }
+                            else
+                            {
+                                ThrowRuntimeException($"Cannot perform get index on type '{targetValue.type}'");
+                            }
+
+                            SetLocalRegisterFromValue(packet.b3, res);
+                            Push(res);
+                        }
+                        break;
+
+                    case OpCode.SET_INDEX:
+                        {
+                            var (newValue, index, listValue) = Pop3OrLocals(packet.b1, packet.b2, packet.b3);
+                            DoSetIndexOp(newValue, index, listValue);
+                        }
+                        break;
+
+                    case OpCode.EXPAND_COPY_TO_STACK:
+                        DoExpandCopyToStackOp(opCode);
+                        break;
+
+                    case OpCode.TYPEOF:
+                        Push(Pop().GetClassType());
+                        break;
+
+                    case OpCode.COUNT_OF:
+                        {
+                            var target = PopOrLocal(packet.b1);
+                            DoCountOfOp(target);
+                        }
+                        break;
+
+                    case OpCode.GOTO:
+                        _currentCallFrame.InstructionPointer = chunk.GetLabelPosition(packet.labelDetails.LabelId);
+                        break;
+
+                    case OpCode.GOTO_IF_FALSE:
+                        if (Peek().IsFalsey())
+                            _currentCallFrame.InstructionPointer = chunk.GetLabelPosition(packet.labelDetails.LabelId);
+                        break;
+
+                    case OpCode.ENUM_VALUE:
+                        {
+                            var (enumObject, val, key) = Pop3OrLocals(packet.b1, packet.b2, packet.b3);
+                            (enumObject.val.asClass as EnumClass).AddEnumValue(key, val);
+                        }
+                        break;
+
+                    case OpCode.READ_ONLY:
+                        DoReadOnlyOp(chunk);
+                        break;
+                    case OpCode.GET_FIELD:
+                        DoGetFieldOp(chunk, packet.b1);
+                        break;
+                    case OpCode.SET_FIELD:
+                        DoSetFieldOp(chunk, packet.b1);
+                        break;
+                    case OpCode.NONE:
+                    default:
+                        ThrowRuntimeException($"Unhandled OpCode '{opCode}'.");
+                        break;
+                }
+
+                //UnityEngine.Debug.Log("== StackDump ==\n" + 
+                //                       VmUtil.GenerateValueStackDump(this));
+                //UnityEngine.Debug.Log("== StackEnd  ==");
+            }
+            //UnityEngine.Debug.Log("run beendet");
+            interpreterState = InterpreterState.STOPPED;
+            return InterpreterResult.OK;            
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private void SetLocalRegisterFromValue(byte localSetLocation, Value res)
+        {
+            if (localSetLocation != Optimiser.NOT_LOCAL_BYTE)
+            {
+                _valueStack[_currentCallFrame.StackStart + localSetLocation] = res;
+            }
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private Value PopOrLocal(byte b1)
+        {
+            return b1 == Optimiser.NOT_LOCAL_BYTE
+                ? _valueStack.Pop()
+                : _valueStack[_currentCallFrame.StackStart + b1];
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private (Value rhs, Value lhs) Pop2OrLocals(byte b1, byte b2)
+        {
+            var rhs = b2 == Optimiser.NOT_LOCAL_BYTE ? Pop() : _valueStack[_currentCallFrame.StackStart + b2];
+            var lhs = b1 == Optimiser.NOT_LOCAL_BYTE ? Pop() : _valueStack[_currentCallFrame.StackStart + b1];
+            return (rhs, lhs);
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private (Value newValue, Value index, Value listValue) Pop3OrLocals(byte b1, byte b2, byte b3)
+        {
+            var newValue = b3 == Optimiser.NOT_LOCAL_BYTE ? Pop() : _valueStack[_currentCallFrame.StackStart + b3];
+            var index = b2 == Optimiser.NOT_LOCAL_BYTE ? Pop() : _valueStack[_currentCallFrame.StackStart + b2];
+            var listValue = b1 == Optimiser.NOT_LOCAL_BYTE ? Pop() : _valueStack[_currentCallFrame.StackStart + b1];
+            return (newValue, index, listValue);
+        }
+
+        public void ThrowRuntimeException(string msg)
+        {
+            var frame = _currentCallFrame;
+            var currentInstruction = frame.InstructionPointer;
+            interpreterState = InterpreterState.ERROR;
+
+            throw new RuntimeUloxException(msg,
+                currentInstruction,
+                VmUtil.GetLocationNameFromFrame(frame),
+                VmUtil.GenerateValueStackDump(this),
+                VmUtil.GenerateCallStackDump(this));
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private void DoCountOfOp(Value target)
+        {
+            if (target.type == ValueType.Instance)
+            {
+                if (target.val.asInstance is INativeCollection col)
+                {
+                    Push(col.Count());
+                    return;
+                }
+            }
+
+            ThrowRuntimeException($"Cannot perform countof on '{target}'");
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private void DoReadOnlyOp(Chunk chunk)
+        {
+            var target = Pop();
+            if (target.type != ValueType.Instance
+                && target.type != ValueType.UserType)
+                ThrowRuntimeException($"Cannot perform readonly on '{target}'. Got unexpected type '{target.type}'");
+
+            target.val.asInstance.ReadOnly();
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private (bool meets, string msg) ProcessContract(Value lhs, Value rhs)
+        {
+            switch (lhs.type)
+            {
+            case ValueType.UserType:
+                return MeetValidator.ValidateClassMeetsClass(lhs.val.asClass, rhs.val.asClass);
+
+            case ValueType.Instance:
+                switch (rhs.type)
+                {
+                case ValueType.UserType:
+                    return MeetValidator.ValidateInstanceMeetsClass(lhs.val.asInstance, rhs.val.asClass);
+
+                case ValueType.Instance:
+                    return MeetValidator.ValidateInstanceMeetsInstance(lhs.val.asInstance, rhs.val.asInstance);
+                }
+                break;
+            }
+            ThrowRuntimeException($"Unsupported meets operation, got left hand side of type '{lhs.type}' and right hand side of type '{rhs.type}'");
+            return default;
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private void DoSetIndexOp(Value newValue, Value indexOrName, Value target)
+        {
+            if (target.type == ValueType.Instance)
+            {
+                if (target.val.asInstance is INativeCollection nativeCol)
+                {
+                    nativeCol.Set(indexOrName, newValue);
+                }
+                else
+                {
+                    var inst = target.val.asInstance;
+                    inst.Fields.Set(indexOrName.val.asString, newValue);
+                }
+
+                Push(newValue);
+                return;
+            }
+
+            ThrowRuntimeException($"Cannot perform set index on type '{target.type}'");
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private void DoExpandCopyToStackOp(OpCode opCode)
+        {
+            var v = Pop();
+            if (v.type == ValueType.Instance
+                && v.val.asInstance is NativeListInstance nativeList)
+            {
+                var l = nativeList.List;
+                for (int i = 0; i < l.Count; i++)
+                {
+                    Push(l[i]);
+                }
+            }
+            else
+            {
+                Push(v);
+            }
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private void DoValidateOp(ValidateOp validateOp)
+        {
+            switch (validateOp)
+            {
+            case ValidateOp.Meets:
+            {
+                var (rhs, lhs) = Pop2();
+                var (meets, _) = ProcessContract(lhs, rhs);
+                Push(Value.New(meets));
+            }
+            break;
+            case ValidateOp.Signs:
+            {
+                var (rhs, lhs) = Pop2();
+                var (meets, msg) = ProcessContract(lhs, rhs);
+                if (!meets)
+                    ThrowRuntimeException($"Sign failure with msg '{msg}'");
+            }
+            break;
+            default:
+                ThrowRuntimeException($"Unhandled validate op '{validateOp}'");
+                break;
+            }
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private void DoClosureOp(Chunk chunk, ByteCodePacket.ClosureDetails closureDetails)
+        {
+            var type = closureDetails.ClosureType;
+            var b1 = closureDetails.b1;
+            if (type != ClosureType.Closure)
+                ThrowRuntimeException($"Closure type '{type}' unexpected.");
+
+            var constantIndex = b1;
+            var func = chunk.ReadConstant(constantIndex); //always func
+            var closureVal = Value.New(new ClosureInternal() { chunk = func.val.asChunk });
+            Push(closureVal);
+
+            var closure = closureVal.val.asClosure;
+
+            for (int i = 0; i < closure.upvalues.Length; i++)
+            {
+                var packet = ReadPacket(chunk);
+                var isLocal = packet.closureDetails.b1;
+                var index = packet.closureDetails.b2;
+                if (isLocal == 1)
+                {
+                    var local = _currentCallFrame.StackStart + index;
+                    closure.upvalues[i] = CaptureUpvalue(local);
+                }
+                else
+                {
+                    closure.upvalues[i] = _currentCallFrame.Closure.upvalues[index];
+                }
+            }
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private bool DoReturnOp()
+        {
+            var origCallFrameCount = _callFrames.Count;
+            var wantsToYieldOnReturn = _currentCallFrame.YieldOnReturn;
+
+            ProcessReturns();
+
+            return _callFrames.Count == 0
+                || (_callFrames.Count < origCallFrameCount && wantsToYieldOnReturn)
+                || _currentCallFrame.InstructionPointer >= _currentChunk.instructionCount;
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private void DoNativeCall(OpCode opCode)
+        {
+            if (_currentCallFrame.nativeFunc == null)
+                ThrowRuntimeException($"{opCode} without nativeFunc encountered. This is not allowed");
+            var argCount = _valueStack.Count - _currentCallFrame.StackStart;
+            var res = NativeCallResult.Failure;
+            try
+            {
+                res = _currentCallFrame.nativeFunc.Invoke(this);
+            }
+            catch (System.Exception e)
+            {
+                ProcessReturns();
+                ThrowRuntimeException(
+                    $"Native call failed with inner{Environment.NewLine}" +
+                    $" '{e}'"
+                );
+            }
+
+            if (res == NativeCallResult.SuccessfulExpression)
+            {
+                ProcessReturns();
+            }
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private void ProcessReturns()
+        {
+            var returnStart = _currentCallFrame.StackStart + _currentCallFrame.ArgCount + 1;
+            var returnCount = _currentCallFrame.ReturnCount;
+            if (_currentCallFrame.ReturnCount == 0)
+            {
+                returnStart = _currentCallFrame.StackStart;
+                returnCount = 1;
+            }
+
+            CloseUpvalues(_currentCallFrame.StackStart);
+
+            {
+                var poppedStackStart = _currentCallFrame.StackStart;
+                //remove top
+                var popped = _callFrames.Pop();
+
+                Tracing?.ProcessPopCallFrame(popped);
+
+                //update cache
+                if (_callFrames.Count > 0)
+                {
+                    _currentCallFrame = _callFrames.Peek();
+                    _currentChunk = _currentCallFrame.Closure.chunk;
+                }
+                else
+                {
+                    _currentCallFrame = default;
+                    _currentChunk = default;
+                }
+
+                //transfer returns back down the stack
+                for (var i = 0; i < returnCount; i++)
+                    _valueStack[poppedStackStart + i] = _valueStack[returnStart + i];
+
+                var toRemove = System.Math.Max(0, _valueStack.Count - poppedStackStart - returnCount);
+                _valueStack.DiscardPop(toRemove);
+            }
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private void DoMultiVarOp(byte b1, byte b2)
+        {
+            if (b1 == 1)
+                _currentCallFrame.MultiAssignStart = (byte)_valueStack.Count;
+            else
+            {
+                //this is only so the multi return validate mechanism can continue to function,
+                //it's not actually contributing to how multi return works.
+                var returnCount = _valueStack.Count - _currentCallFrame.MultiAssignStart;
+                var requestedResults = b2;
+                var availableResults = returnCount;
+                if (requestedResults != availableResults)
+                    ThrowRuntimeException($"Multi var assign to result mismatch. Taking '{requestedResults}' but results contains '{availableResults}'");
+            }
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private void CloseUpvalues(int last)
+        {
+            while (openUpvalues.Count > 0 &&
+                openUpvalues.First.Value.val.asUpvalue.index >= last)
+            {
+                var upvalue = openUpvalues.First.Value.val.asUpvalue;
+                upvalue.value = _valueStack[upvalue.index];
+                upvalue.index = -1;
+                upvalue.isClosed = true;
+                openUpvalues.RemoveFirst();
+            }
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private Value CaptureUpvalue(int index)
+        {
+            var node = openUpvalues.First;
+
+            while (node != null && node.Value.val.asUpvalue.index > index)
+            {
+                node = node.Next;
+            }
+
+            if (node != null && node.Value.val.asUpvalue.index == index)
+            {
+                return node.Value;
+            }
+
+            var upvalIn = new UpvalueInternal() { index = index };
+            var upval = Value.New(upvalIn);
+
+            if (node != null)
+                openUpvalues.AddBefore(node, upval);
+            else
+                openUpvalues.AddLast(upval);
+
+            return upval;
+        }
+        
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public InterpreterResult PushCallFrameRunYield(Value callee, byte argCount)
+        {
+            PushCallFrameFromValue(callee, argCount);
+            _currentCallFrame.YieldOnReturn = true;
+            Run().Forget();
+            return InterpreterResult.OK;
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public void PushCallFrameFromValue(Value callee, byte argCount)
+        {
+            //UnityEngine.Debug.Log($" - PushCallFrameFromValue : Type {callee.type} Val : {callee.val}");
+            switch (callee.type)
+            {
+            case ValueType.NativeFunction:
+                    //UnityEngine.Debug.Log($" - Call NativeFunction");
+                    if (argCount != callee.val.asByte1)
+                        ThrowRuntimeException($"Native function '{callee.val.asNativeFunc.Method.Name}' expected '{callee.val.asByte1}' arguments but got '{argCount}'");
+
+                    PushFrameCallNative(callee.val.asNativeFunc, argCount, callee.val.asByte0);
+                break;
+
+            case ValueType.Closure:
+                    //UnityEngine.Debug.Log($" - Call Closure");
+    
+                    Call(callee.val.asClosure, argCount);
+                break;
+
+            case ValueType.UserType:
+                    //UnityEngine.Debug.Log($" - CreateInstance (callee:{callee.val},argcount:{argCount})");
+                    CreateInstance(callee.val.asClass, argCount);
+                break;
+
+            case ValueType.BoundMethod:
+                    //UnityEngine.Debug.Log($" - Call Method");
+                    CallMethod(callee.val.asBoundMethod, argCount);
+                break;
+
+            default:
+                    ThrowRuntimeException($"Invalid Call, value type {callee.type} is not handled");
+                break;
+            }
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private void Call(ClosureInternal closureInternal, byte argCount)
+        {
+            if (argCount != closureInternal.chunk.ArgumentConstantIds.Count)
+                ThrowRuntimeException($"Wrong number of params given to '{closureInternal.chunk.ChunkName}'" +
+                    $", got '{argCount}' but expected '{closureInternal.chunk.ArgumentConstantIds.Count}'");
+
+            var stackStart = (byte)System.Math.Max(0, _valueStack.Count - argCount - 1);
+            PushNewCallFrame(new CallFrame()
+            {
+                StackStart = stackStart,
+                Closure = closureInternal,
+                ArgCount = argCount,
+                ReturnCount = (byte)closureInternal.chunk.ReturnConstantIds.Count
+            });
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private void PushFrameCallNative(CallFrame.NativeCallDelegate nativeCallDel, byte argCount, byte returnCount)
+        {
+            PushNewCallFrame(new CallFrame()
+            {
+                StackStart = (byte)(_valueStack.Count - argCount - 1),
+                Closure = NativeCallClosure,
+                nativeFunc = nativeCallDel,
+                InstructionPointer = 0,
+                ArgCount = argCount,
+                ReturnCount = returnCount,
+            });
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private void DoGetPropertyOp(Chunk chunk, byte constantIndex, Value targetVal)
+        {
+            //use class to build a cached route to the field, introduce an cannot cache instruction
+            //  once there are class vars this can be done through that as those are known and safe, not
+            //  dynamically added at will to arbitrary objects.
+            //if the class has the property name then we know it MUST be there, find it's index and then rewrite
+            //  problem then is that the chunk could be given different object types, we need to fall back if a
+            //  different type is given or generate variants for each type
+            //the problem here is we don't know that the targetVal is of the same type that we are caching so
+            //  turn it off for now.
+
+            var instance = default(InstanceInternal);
+
+            switch (targetVal.type)
+            {
+            case ValueType.UserType:
+                instance = targetVal.val.asClass;
+                break;
+
+            case ValueType.Instance:
+                instance = targetVal.val.asInstance;
+                break;
+
+            default:
+                ThrowRuntimeException($"Only classes and instances have properties. Got a {targetVal.type} with value '{targetVal}'");
+                break;
+            }
+
+            var name = chunk.ReadConstant(constantIndex).val.asString; //always string
+
+            if (instance.Fields.Get(name, out var val))
+            {
+                Push(val);
+                return;
+            }
+
+            //attempt to bind the method
+            var fromClass = instance.FromUserType;
+
+            if (fromClass == null)
+            {
+                //try to find a static method
+                if (instance is UserTypeInternal userTypeInstance)
+                {
+                    if (userTypeInstance.Methods.Get(name, out var userTypeMethod))
+                    {
+                        Push(userTypeMethod);
+                        return;
+                    }
+                    ThrowRuntimeException($"Undefined method '{name}', no method found on usertype'{userTypeInstance}'");
+                }
+                else
+                {
+                    ThrowRuntimeException($"Undefined property '{name}', cannot bind method as it has no fromClass");
+                }
+            }
+
+            if (!fromClass.Methods.Get(name, out var method))
+                ThrowRuntimeException($"Undefined method '{name}'");
+
+            var receiver = targetVal;
+            var meth = method.val.asClosure;
+            var bound = Value.New(new BoundMethod(receiver, meth));
+
+            Push(bound);
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private void DoSetPropertyOp(Chunk chunk, byte constantIndex, Value targetVal, Value newVal)
+        {
+            InstanceInternal instance = null;
+
+            switch (targetVal.type)
+            {
+            default:
+                ThrowRuntimeException($"Only classes and instances have properties. Got a {targetVal.type} with value '{targetVal}'");
+                break;
+            case ValueType.UserType:
+                instance = targetVal.val.asClass;
+                break;
+
+            case ValueType.Instance:
+                instance = targetVal.val.asInstance;
+                break;
+            }
+
+            var name = chunk.ReadConstant(constantIndex).val.asString; //always string
+
+            instance.SetField(name, newVal);
+
+            Push(newVal);
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private void DoGetFieldOp(Chunk chunk, byte b1)
+        {
+            //Error checking is for comleteness, presenly this op is only emitted after validation that the property exists
+            var argID = chunk.ReadConstant(b1); //always string
+            var target = _valueStack[_currentCallFrame.StackStart];
+            if (target.type != ValueType.Instance)
+                ThrowRuntimeException($"Cannot get field on non instance type '{target.type}'");
+
+            var inst = target.val.asInstance;
+            if (!inst.Fields.Get(argID.val.asString, out var val))
+                ThrowRuntimeException($"No field of name '{argID.val.asString}' found on '{inst}'");
+
+            Push(val);
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private void DoSetFieldOp(Chunk chunk, byte b1)
+        {
+            //Error checking is for comleteness, presenly this op is only emitted after validation that the property exists
+            var argID = chunk.ReadConstant(b1); //always string
+            var target = _valueStack[_currentCallFrame.StackStart];
+            if (target.type != ValueType.Instance)
+                ThrowRuntimeException($"Cannot set field on non instance type '{target.type}'");
+
+            var inst = target.val.asInstance;
+            inst.SetField(argID.val.asString, Peek());
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private void DoInvokeOp(Chunk chunk, byte constantIndex, byte argCount)
+        {
+            var methodName = chunk.ReadConstant(constantIndex).val.asString; //always string
+
+            var receiver = Peek(argCount);
+            switch (receiver.type)
+            {
+            case ValueType.Instance:
+            {
+                var inst = receiver.val.asInstance;
+
+                //it could be a field
+                if (inst.Fields.Get(methodName, out var fieldFunc))
+                {
+                    _valueStack[_valueStack.Count - 1 - argCount] = fieldFunc;
+                    PushCallFrameFromValue(fieldFunc, argCount);
+                }
+                else
+                {
+                    var fromClass = inst.FromUserType;
+                    if (fromClass == null)
+                    {
+                        ThrowRuntimeException($"Cannot invoke '{methodName}' on '{receiver}' with no class");
+                    }
+
+                    if (!fromClass.Methods.Get(methodName, out var method))
+                    {
+                        ThrowRuntimeException($"No method of name '{methodName}' found on '{fromClass}'");
+                    }
+
+                    PushCallFrameFromValue(method, argCount);
+                }
+            }
+            break;
+
+            case ValueType.UserType:
+            {
+                var klass = receiver.val.asClass;
+                klass.Methods.Get(methodName, out var methObj);
+                PushCallFrameFromValue(methObj, argCount);
+            }
+            break;
+
+            default:
+                ThrowRuntimeException($"Cannot invoke '{methodName}' on '{receiver}'");
+                break;
+            }
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private void CallMethod(BoundMethod asBoundMethod, byte argCount)
+        {
+            _valueStack[_valueStack.Count - 1 - argCount] = asBoundMethod.Receiver;
+            Call(asBoundMethod.Method, argCount);
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private void CreateInstance(UserTypeInternal asClass, byte argCount)
+        {
+            //platform.Log("# CreateInstance");
+            var instInternal = asClass.MakeInstance();
+            var inst = Value.New(instInternal);
+            var stackCount = _valueStack.Count;
+            var instLocOnStack = (byte)(stackCount - argCount - 1);
+            _valueStack[instLocOnStack] = inst;
+
+            //InitNewInstance
+            if (!asClass.Initialiser.IsNull())
+            {
+                //with an init list we don't return this
+                PushCallFrameFromValue(asClass.Initialiser, argCount);
+            }
+            else if (argCount != 0)
+            {
+                ThrowRuntimeException($"Expected zero args for class '{asClass}', as it does not have an 'init' method but got {argCount} args");
+            }
+
+            foreach (var (chunk, labelID) in asClass.InitChains)
+            {
+                if (!asClass.Initialiser.IsNull())
+                    Push(inst);
+
+                PushNewCallFrame(new CallFrame()
+                {
+                    Closure = new ClosureInternal { chunk = chunk },
+                    InstructionPointer = chunk.GetLabelPosition(labelID),
+                    StackStart = (byte)(_valueStack.Count - 1), //last thing checked
+                });
+            }
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        internal void MoveInstructionPointerTo(ushort loc)
+        {
+            _currentCallFrame.InstructionPointer = loc;
+        }
+
+        public void PrepareTypes(TypeInfo typeInfo)
+        {
+            foreach (var type in typeInfo.Types)
+            {
+                if (Globals.Contains(new HashedString(type.Name))) continue;
+
+                var klass = type.UserType == UserType.Class
+                    ? new UserTypeInternal(type)
+                    : new EnumClass(type);
+                klass.PrepareFromType(this);
+                var klassVal = Value.New(klass);
+                Globals.AddOrSet(klass.Name, klassVal);
+            }
+        }
+
+        internal void Clear()
+        {
+            _valueStack.Reset();
+            _callFrames.Reset();
+            _currentCallFrame = default;
+            _currentChunk = default;
+        }
+    }
+
+    public static class MeetValidator
+    {
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public static (bool meets, string msg) ValidateClassMeetsClass(UserTypeInternal lhs, UserTypeInternal contract)
+        {
+            foreach (var contractMeth in contract.Methods)
+            {
+                if (!lhs.Methods.Get(contractMeth.Key, out var ourContractMatchingMeth))
+                    return (false, $"'{lhs.Name.String}' does not contain matching method '{contractMeth.Key.String}'.");
+
+                var contractChunk = contractMeth.Value.val.asClosure.chunk;
+                var ourContractMatchingChunk = ourContractMatchingMeth.val.asClosure.chunk;
+                var res = ChunkMatcher(ourContractMatchingChunk, contractChunk);
+                if (!res.meets)
+                    return res;
+
+            }
+
+            foreach (var contractVar in contract.FieldNames)
+            {
+                if (lhs.FieldNames.FirstOrDefault(x => x == contractVar) == null)
+                {
+                    return (false, $"'{lhs.Name.String}' has no field of name '{contractVar.String}'.");
+                }
+            }
+            return (true, string.Empty);
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public static (bool meets, string msg) ValidateInstanceMeetsClass(InstanceInternal lhs, UserTypeInternal contract)
+        {
+            foreach (var contractMeth in contract.Methods)
+            {
+                Value ourContractMatchingMeth = Value.Null();
+                if (lhs.Fields.Get(contractMeth.Key, out ourContractMatchingMeth)
+                    || lhs.FromUserType.Methods.Get(contractMeth.Key, out ourContractMatchingMeth))
+                {
+                    if (contractMeth.Value.type == ValueType.Closure
+                        && ourContractMatchingMeth.type == ValueType.Closure)
+                    {
+                        var res = ChunkMatcher(ourContractMatchingMeth.val.asClosure.chunk, contractMeth.Value.val.asClosure.chunk);
+                        if (!res.meets)
+                            return res;
+                    }
+                }
+                else
+                {
+                    return (false, $"instance does not contain matching method '{contractMeth.Key.String}'.");
+                }
+            }
+
+            foreach (var contractVar in contract.FieldNames)
+            {
+                if (!lhs.Fields.Get(contractVar, out var _))
+                {
+                    return (false, $"instance does not contain matching field '{contractVar.String}'.");
+                }
+            }
+
+            return (true, string.Empty);
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public static (bool meets, string msg) ValidateInstanceMeetsInstance(InstanceInternal lhs, InstanceInternal contract)
+        {
+            if (lhs.GetType() != contract.GetType())
+                return (false, $"instance does not match internal type, expected '{contract.GetType()}' but found '{lhs.GetType()}'.");
+
+            if ((lhs.FromUserType == null || lhs.FromUserType is DynamicClass)
+                && (contract.FromUserType == null || contract.FromUserType is DynamicClass))
+            {
+                return InstanceContentMatcher(lhs, contract);
+            }
+
+            return ValidateInstanceMeetsClass(lhs, contract.FromUserType);
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private static (bool meets, string msg) InstanceContentMatcher(InstanceInternal lhs, InstanceInternal contract)
+        {
+            foreach (var field in contract.Fields)
+            {
+                Value ourMatch = Value.Null();
+                if (lhs.Fields.Get(field.Key, out ourMatch)
+                    || lhs.FromUserType.Methods.Get(field.Key, out ourMatch))
+                {
+                    if (field.Value.type != ourMatch.type)
+                        return (false, $"instance has matching field name '{field.Key.String}' but type does not match, expected '{ourMatch.type}' but found '{field.Value.type}'.");
+
+                    switch (field.Value.type)
+                    {
+                    case ValueType.Closure:
+                        var contractMeth = field.Value.val.asClosure.chunk;
+                        var resClosure = ChunkMatcher(ourMatch.val.asClosure.chunk, contractMeth);
+                        if (!resClosure.meets)
+                            return resClosure;
+                        break;
+                    case ValueType.Instance:
+                        var resInst = ValidateInstanceMeetsInstance(ourMatch.val.asInstance, field.Value.val.asInstance);
+                        if (!resInst.meets)
+                            return resInst;
+                        break;
+                    default:
+                        break;
+                    }
+                }
+                else
+                {
+                    return (false, $"instance does not contain matching field '{field.Key.String}'.");
+                }
+            }
+            return (true, string.Empty);
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private static (bool meets, string msg) ChunkMatcher(Chunk lhsMatchingChunk, Chunk contractChunk)
+        {
+            var contractMethArity = contractChunk.ArgumentConstantIds.Count;
+            var ourArity = lhsMatchingChunk.ArgumentConstantIds.Count;
+            if (ourArity != contractMethArity)
+                return (false, $"Expected arity '{contractMethArity}' but found '{ourArity}'.");
+
+            if (lhsMatchingChunk.ReturnConstantIds.Count != contractChunk.ReturnConstantIds.Count)
+                return (false, $"Expected return count '{contractChunk.ReturnConstantIds.Count}' but found '{lhsMatchingChunk.ReturnConstantIds.Count}'.");
+
+            return (true, string.Empty);
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public static (bool meets, string msg) ValidateClassMeetsClass(TypeInfoEntry targetType, TypeInfoEntry contractType)
+        {
+            foreach (var field in contractType.Fields)
+            {
+                if (!targetType.Fields.Contains(field))
+                    return (false, $"Type '{targetType.Name}' does not contain matching field '{field}'.");
+            }
+
+            foreach (var method in contractType.Methods)
+            {
+                var found = targetType.Methods.FirstOrDefault(x => x.ChunkName == method.ChunkName);
+                if (found == null)
+                    return (false, $"Type '{targetType.Name}' does not contain matching method '{method.ChunkName}'.");
+
+                var (meets, msg) = ChunkMatcher(method, found);
+                if(!meets)
+                    return (false, msg);
+            }
+
+            return (true, string.Empty);
+        }
+    }
+    public static class VmUtil
+    {
+        public static string GenerateGlobalsDump(Vm vm)
+        {
+            var sb = new System.Text.StringBuilder();
+
+            foreach (var item in vm.Globals)
+            {
+                sb.Append($"{item.Key} : {item.Value}");
+            }
+
+            return sb.ToString();
+        }
+        
+        public static string GenerateCallStackDump(Vm vm)
+        {
+            var sb = new System.Text.StringBuilder();
+
+            for (int i = 0; i < vm.CallFrames.Count; i++)
+            {
+                var cf = vm.CallFrames.Peek(i);
+                sb.AppendLine(GetLocationNameFromFrame(cf));
+            }
+
+            return sb.ToString();
+        }
+        
+        public static string GenerateValueStackDump(Vm vm) => DumpStack(vm.ValueStack);
+        
+        private static string DumpStack(FastStack<Value> valueStack)
+        {
+            var stackVars = valueStack
+                .Select(x => x.ToString())
+                .Take(valueStack.Count)
+                .Reverse();
+
+            return string.Join(System.Environment.NewLine, stackVars);
+        }
+
+        internal static string GetLocationNameFromFrame(CallFrame frame)
+        {
+            var currentInstruction = frame.InstructionPointer;
+            if (frame.nativeFunc != null)
+            {
+                var name = frame.nativeFunc.Method.Name;
+                if (frame.nativeFunc.Target != null)
+                    name = frame.nativeFunc.Target.GetType().Name + "." + frame.nativeFunc.Method.Name;
+                return $"native:'{name}'";
+            }
+
+            var line = -1;
+            if (currentInstruction != -1)
+                line = frame.Closure?.chunk?.GetLineForInstruction(currentInstruction) ?? -1;
+
+            var locationName = frame.Closure?.chunk.GetLocationString(line);
+            return $"chunk:'{locationName}'";
+        }
+    }
+
+}

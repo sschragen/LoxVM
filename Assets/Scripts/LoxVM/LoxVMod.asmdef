@@ -1,0 +1,33 @@
+{
+    "name": "LoxVMod",
+    "rootNamespace": "LoxVMod",
+    "references": [
+        "GUID:2bafac87e7f4b9b418d9448d219b01ab",
+        "GUID:6546d7765b4165b40850b3667f981c26",
+        "GUID:6055be8ebefd69e48b49212b09b47b2f"
+    ],
+    "includePlatforms": [
+        "Editor",
+        "WindowsStandalone32",
+        "WindowsStandalone64"
+    ],
+    "excludePlatforms": [],
+    "allowUnsafeCode": true,
+    "overrideReferences": true,
+    "precompiledReferences": [
+        "Assembly-CSharp.dll",
+        "Assembly-CSharp-firstpass.dll",
+        "0Harmony.dll",
+        "BepInEx.dll",
+        "StationeersMods.Cecil.dll",
+        "StationeersMods.Interface.dll",
+        "StationeersMods.Shared.dll",
+        "StationeersMods.Editor.dll",
+        "UniTask.dll",
+        "Newtonsoft.Json.dll"
+    ],
+    "autoReferenced": true,
+    "defineConstraints": [],
+    "versionDefines": [],
+    "noEngineReferences": false
+}

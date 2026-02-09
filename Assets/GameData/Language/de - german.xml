@@ -1,0 +1,30 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Language xmlns:xsd="http://www.w3.org/2001/XMLSchema" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">
+    <Name>Deutsch</Name>
+    <Code>DE</Code>
+    <Font>font_german</Font>
+    <Things>
+		<RecordThing>
+			<Key>LoxMotherboard</Key>
+			<Value>Lox VM Motherboard</Value>
+			<Description> 
+				Entickelt wurde diese Hauptplatine von SRA Corp. in 2026. Von ersten Versuchen mit dem intergrierten 
+				Moonsharp über Bite, Wren und Miniscript wurde die Entwickling auf Lox festgelegt. Die aktuelle Lox Implementierung
+				geht über den Lox Standard hinaus und ist auf dem GitHub von Steve Hallywell erklärt. 
+				Die Lox-Stationeers Bibliotheken befinden sich noch in der Entwicklung.
+				
+				Programme die die Hauptlatine auf dem Bildschirm anzeigt haben die Endung .lox und müssen im Ordner
+				/Eigene Dateien/Dokumente/My Games/Stationeers/scripts/Lox liegen. 
+				Bibliotheken mit der Endung .loxlib liegen ebenfalls dort. 
+				Vordefinierte Systembibliotheken findest Du unter /.... TODO
+				
+				Der Zustand der Virtuellen Maschine wird beim Verlassen des Spiels nicht abgespeichert.
+				Nach dem Neuladen beginnt der Programmablauf von vorne. 
+				
+				Nach dem Programmstart werden alle Bibliotheken einmal ausgeführt und dann das Hauptprogramm.
+				Falls definiert, wird automatisch einmal die Funktion Start() und dann zyklich die Funktion
+				Update() ausgeführt.
+			</Description>
+		</RecordThing>
+	</Things>
+</Language>

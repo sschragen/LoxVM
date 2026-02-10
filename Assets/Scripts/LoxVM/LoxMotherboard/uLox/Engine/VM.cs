@@ -180,7 +180,7 @@ namespace ULox
             
             interpreterState = InterpreterState.RUNNING;
             float now = Time.time;
-            float nextYield = now + platform.TimeSlice();// runtimeLimit;
+            float nextYield = now + platform.GetTimeSlice();// runtimeLimit;
             //platform.Warn($"Time.Now : {now} Next Yield {nextYield}");
             while (interpreterState != InterpreterState.STOPPED)
             {
@@ -202,7 +202,7 @@ namespace ULox
                         if (interpreterState == InterpreterState.YIELDED)
                             interpreterState = InterpreterState.RUNNING;
 
-                        nextYield = Time.time + platform.TimeSlice();// runtimeLimit;
+                        nextYield = Time.time + platform.GetTimeSlice();// runtimeLimit;
                         break;
                     case InterpreterState.SLEEPING:
                         await UniTask.WaitForSeconds((float)interpreterSleepTime);
@@ -210,7 +210,7 @@ namespace ULox
                         if (interpreterState==InterpreterState.SLEEPING)
                             interpreterState = InterpreterState.RUNNING;
 
-                        nextYield = Time.time + platform.TimeSlice();// runtimeLimit;
+                        nextYield = Time.time + platform.GetTimeSlice();// runtimeLimit;
                         break;
                     case InterpreterState.STOPPED:
                         return InterpreterResult.OK;
@@ -219,7 +219,7 @@ namespace ULox
                         {
                             await UniTask.DelayFrame(20);
                         }while (interpreterState==InterpreterState.PAUSED);
-                        nextYield = Time.time + platform.TimeSlice();// runtimeLimit;
+                        nextYield = Time.time + platform.GetTimeSlice();// runtimeLimit;
                         break;
                 }
                 switch (opCode)

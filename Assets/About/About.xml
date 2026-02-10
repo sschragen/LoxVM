@@ -2,7 +2,7 @@
 <ModMetadata xmlns:xsd="http://www.w3.org/2001/XMLSchema" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">
   <Name>LoxVMod</Name>
   <Author>Stephanus Schragen</Author>
-  <Version>0.7.1699</Version>
+  <Version>0.7.1710</Version>
   <!-- Steam description using steam styling tags for Steam workshop page -->
   <Description>
 	  [h1]Lox Virtual Machine[/h1]

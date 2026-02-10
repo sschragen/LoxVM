@@ -56,10 +56,14 @@ namespace LoxVMod
             executionContext.AddLibrary(new StdLibrary());
             executionContext.AddLibrary(new LoxStationeersLibrary(connectedDevices, console));
         }
-
-        public float TimeSlice()
+        private float timeSlice = 0.02f;
+        public float GetTimeSlice()
         {
-            return 0.1f;
+            return timeSlice;
+        }
+        public void SetTimeSlice(float timeSlice)
+        {
+            this.timeSlice = timeSlice; 
         }
     }
 }

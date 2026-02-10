@@ -11,7 +11,8 @@ namespace ULox
 
     public interface IPlatformConfig
     {
-        float TimeSlice();
+        float GetTimeSlice();
+        void SetTimeSlice(float time);
     }
     public interface IPlatformFiles
     {
@@ -77,7 +78,12 @@ namespace ULox
             throw new NotImplementedException();
         }
 
-        public float TimeSlice()
+        public float GetTimeSlice()
+        {
+            throw new NotImplementedException();
+        }
+
+        public void SetTimeSlice(float time)
         {
             throw new NotImplementedException();
         }

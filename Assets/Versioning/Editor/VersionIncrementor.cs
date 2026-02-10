@@ -17,19 +17,16 @@ class VersionIncrementor : IPreprocessBuildWithReport
     {
         IncrementVersion(new int[] { 0, 0, 1 });
     }
-
     [MenuItem("Build/Increase Minor Version")]
     private static void IncreaseMinor()
     {
         IncrementVersion(new int[] { 0, 1, 0 });
     }
-
     [MenuItem("Build/Increase Major Version")]
     private static void IncreaseMajor()
     {
         IncrementVersion(new int[] { 1, 0, 0 });
     }
-
     static VersionIncrementor()
     {
         //If you want the scene to be fully loaded before your startup operation, 
@@ -37,7 +34,6 @@ class VersionIncrementor : IPreprocessBuildWithReport
         // logic until the first editor update, like this:
         EditorApplication.update += RunOnce;
     }
-
     static void RunOnce()
     {
         EditorApplication.update -= RunOnce;
@@ -49,7 +45,6 @@ class VersionIncrementor : IPreprocessBuildWithReport
 
         Debug.Log("new Build Version : " + PlayerSettings.bundleVersion.ToString());
     }
-
     static void IncrementVersion(int[] versionIncr)
     {
         string[] lines = PlayerSettings.bundleVersion.Split('.');
@@ -64,28 +59,23 @@ class VersionIncrementor : IPreprocessBuildWithReport
                 
             } 
         }
-
         PlayerSettings.bundleVersion = versionIncr[0] + "." + versionIncr[1] + "." + versionIncr[2];
-
-        
-
-    } 
-
+    }
     public static string GetLocalVersion()
     {
         return PlayerSettings.bundleVersion.ToString();
     }
-    /*
-    public void OnPreprocessBuild(BuildTarget target, string path)
-    {
-        IncreaseBuild();
-    }
-    */
     public void OnPreprocessBuild(BuildReport report)
     {
         IncreaseBuild();
     }
 
-    public int callbackOrder { get { return 0; } }
+    public int callbackOrder 
+    { 
+        get 
+        { 
+            return 0; 
+        } 
+    }
 }
 #endif

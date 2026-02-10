@@ -29,7 +29,8 @@ namespace LoxVMod
                 (nameof(GetDevicesByType), Value.New(GetDevicesByType, 1, 1)),
                 (nameof(GetDevicesByTypeName), Value.New(GetDevicesByTypeName, 1, 2)),
                 (nameof(GetAllDevices), Value.New(GetAllDevices, 1, 0)),
-                (nameof(Hash),Value.New(Hash,1,1))
+                (nameof(Hash),Value.New(Hash,1,1)),
+                (nameof(SetInstructionsPerFrame),Value.New(SetInstructionsPerFrame,0,1))
             );
         }
         private NativeCallResult Print (Vm vm)
@@ -165,6 +166,20 @@ namespace LoxVMod
             else
             {
                 vm.ThrowRuntimeException("Type of Argument must be <string>.");
+                return NativeCallResult.Failure;
+            }
+        }
+        private NativeCallResult SetInstructionsPerFrame(Vm vm)
+        {
+            var s = vm.GetArg(1);
+            if (s.type == ValueType.Double)
+            {
+                vm.platform.SetTimeSlice((float)s.val.asDouble);
+                return NativeCallResult.SuccessfulExpression;
+            }
+            else
+            {
+                vm.ThrowRuntimeException("Type of Argument must be <number>.");
                 return NativeCallResult.Failure;
             }
         }
